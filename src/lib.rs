@@ -12,7 +12,7 @@
 
 use bytes::Bytes;
 use log::trace;
-use rand::Rng;
+use rand::RngExt;
 use rtsp_types::Message;
 use std::fmt::{Debug, Display};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
