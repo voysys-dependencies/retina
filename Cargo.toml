@@ -19,8 +19,8 @@ rust-version = "1.88"
 default = ["h265"]
 h265 = []
 tracy = [
-    "tracy-client",
-    "tracy-client/use-external-tracy-library",
+    "dep:tracy-client",
+    "tracy-client/enable",
     "tracy-client/ondemand",
 ]
 
@@ -53,7 +53,7 @@ tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
 
-tracy-client = { git = "https://github.com/voysys/rust_tracy_client", branch = "tracy-0.7.8_tracy-client_0.12.7_and_voysys_fixes", optional = true, features = ["enable"] }
+tracy-client = { git = "https://github.com/voysys-dependencies/rust_tracy_client", rev = "2d8c5acb0f13ed605067937951057c77d617a46a", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }

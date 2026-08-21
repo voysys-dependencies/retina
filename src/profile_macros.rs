@@ -16,8 +16,10 @@ macro_rules! profile_zone {
 #[macro_export]
 macro_rules! profile_plot {
     ($name:expr, $var_name:ident, $val:expr) => {{
-        let $var_name: tracy_client::Plot = tracy_client::create_plot!($name);
-        $var_name.point($val as f64);
+        let _ = stringify!($var_name);
+        let client = tracy_client::Client::start();
+        let plot_name = tracy_client::plot_name!($name);
+        client.plot(plot_name, $val as f64);
     }};
 }
 
@@ -31,7 +33,7 @@ macro_rules! profile_plot {
 #[macro_export]
 macro_rules! set_thread_name {
     ($name:expr) => {
-        tracy_client::set_thread_name($name);
+        tracy_client::Client::start().set_thread_name($name);
     };
 }
 
@@ -45,7 +47,7 @@ macro_rules! set_thread_name {
 #[macro_export]
 macro_rules! mark_frame {
     () => {
-        tracy_client::finish_continuous_frame!();
+        tracy_client::Client::start().frame_mark();
     };
 }
 
