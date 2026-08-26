@@ -53,7 +53,7 @@ tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
 
-tracy-client = { git = "https://github.com/voysys-dependencies/rust_tracy_client", rev = "2d8c5acb0f13ed605067937951057c77d617a46a", default-features = false, optional = true }
+tracy-client = { version = "0.19.0", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
