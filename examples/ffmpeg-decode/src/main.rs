@@ -1,4 +1,4 @@
-// Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 extern crate ffmpeg_next as ffmpeg;
@@ -9,7 +9,7 @@ use futures::StreamExt;
 use log::{error, info};
 use retina::{
     client::SetupOptions,
-    codec::{CodecItem, ParametersRef, VideoFrame, VideoParameters},
+    codec::{CodecItem, VideoFrame},
 };
 use std::{fs::File, io::Write, path::Path, str::FromStr, sync::Arc};
 
@@ -44,12 +44,12 @@ struct Opts {
 fn init_logging() -> mylog::Handle {
     let h = mylog::Builder::new()
         .format(
-            ::std::env::var("MOONFIRE_FORMAT")
+            ::std::env::var("RUST_FORMAT")
                 .map_err(|_| ())
                 .and_then(|s| mylog::Format::from_str(&s))
                 .unwrap_or(mylog::Format::Google),
         )
-        .spec(::std::env::var("MOONFIRE_LOG").as_deref().unwrap_or("info"))
+        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
         .build();
     h.clone().install().unwrap();
     h
@@ -76,17 +76,12 @@ struct Processor {
 }
 
 impl Processor {
-    fn new(
-        codec_id: ffmpeg::codec::Id,
-        max_frames: Option<u64>,
-        initial_parameters: Option<&VideoParameters>,
-    ) -> Result<Self, Error> {
+    fn new(codec_id: ffmpeg::codec::Id, max_frames: Option<u64>) -> Result<Self, Error> {
         let codec = ffmpeg::codec::decoder::find(codec_id).unwrap();
-        let mut decoder = ffmpeg::codec::decoder::Decoder(ffmpeg::codec::Context::new());
-        if let Some(p) = initial_parameters {
-            ctx_set_extra_data(&mut decoder, p.extra_data());
-        }
-        let decoder = decoder.open_as(codec)?.video().unwrap();
+        let decoder = ffmpeg::codec::decoder::Decoder(ffmpeg::codec::Context::new())
+            .open_as(codec)?
+            .video()
+            .unwrap();
         Ok(Self {
             decoder,
             scaler: None,
@@ -97,23 +92,10 @@ impl Processor {
     }
 
     /// Returns Ok(false) if max_frames was reached.
-    fn send_frame(
-        &mut self,
-        f: VideoFrame,
-        new_params: Option<&VideoParameters>,
-    ) -> Result<bool, Error> {
+    fn send_frame(&mut self, f: VideoFrame) -> Result<bool, Error> {
         info!("sending frame {} to ffmpeg", self.encoded_frame_i);
         let data = f.into_data();
-
-        // XXX: It'd be better to avoid this copy, but ffmpeg-next offers only a
-        // limited `packet::Borrow` (no mutable access to any aspect of the
-        // packet, not just the main buffer) or a full `packet::Packet` (which
-        // owns the main buffer and can be used with `add_extra_data`). This is
-        // just a proof-of-concept anyway.
-        let mut pkt = ffmpeg::codec::packet::Packet::copy(&data);
-        if let Some(p) = new_params {
-            pkt_add_extra_data(&mut pkt, p.extra_data());
-        }
+        let pkt = ffmpeg::codec::packet::Packet::copy(&data);
         self.decoder.send_packet(&pkt)?;
         self.encoded_frame_i += 1;
         self.receive_frames()
@@ -172,53 +154,11 @@ impl Processor {
             scaler.run(&decoded, &mut scaled)?;
 
             let filename = format!("frame{}.ppm", self.decoded_frame_i);
-            info!("writing {}", &filename);
+            info!("writing {}", filename);
             write_ppm(&scaled, filename)?;
             self.decoded_frame_i += 1;
         }
         Ok(true)
-    }
-}
-
-fn ctx_set_extra_data(ctx: &mut ffmpeg::codec::Context, extra_data: &[u8]) {
-    let len_i32: i32 = extra_data.len().try_into().unwrap();
-    let ffmpeg_owned = ffmpeg_owned_input_buffer(extra_data);
-    unsafe {
-        ffmpeg::sys::av_free((*ctx.as_mut_ptr()).extradata as *mut _);
-        (*ctx.as_mut_ptr()).extradata = ffmpeg_owned;
-        (*ctx.as_mut_ptr()).extradata_size = len_i32;
-    }
-}
-
-fn pkt_add_extra_data(pkt: &mut ffmpeg::codec::packet::Packet, extra_data: &[u8]) {
-    // TODO: add this to ffmpeg-next.
-    //
-    // pkt.add_side_data(
-    //     ffmpeg::codec::packet::side_data::Type::NewExtraData,
-    //     extra_data,
-    // );
-    //
-    // In the meantime, do it manually:
-    let ffmpeg_owned = ffmpeg_owned_input_buffer(extra_data);
-    unsafe {
-        use ffmpeg::packet::Mut as _;
-        ffmpeg::sys::av_packet_add_side_data(
-            pkt.as_mut_ptr(),
-            ffmpeg::codec::packet::side_data::Type::NewExtraData.into(),
-            ffmpeg_owned,
-            extra_data.len(),
-        );
-    }
-}
-
-fn ffmpeg_owned_input_buffer(buf: &[u8]) -> *mut u8 {
-    unsafe {
-        let ffmpeg_owned =
-            ffmpeg::sys::av_malloc(buf.len() + ffmpeg::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize)
-                as *mut u8;
-        assert!(!ffmpeg_owned.is_null());
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), ffmpeg_owned, buf.len());
-        ffmpeg_owned
     }
 }
 
@@ -285,7 +225,9 @@ async fn run() -> Result<(), Error> {
     session
         .setup(
             video_stream_i,
-            SetupOptions::default().transport(opts.transport.clone()),
+            SetupOptions::default()
+                .transport(opts.transport.clone())
+                .frame_format(retina::codec::FrameFormat::SIMPLE),
         )
         .await?;
 
@@ -294,22 +236,13 @@ async fn run() -> Result<(), Error> {
         .await?
         .demuxed()?;
 
-    let initial_parameters = match session.streams()[video_stream_i].parameters() {
-        Some(ParametersRef::Video(v)) => Some(v),
-        Some(_) => unreachable!(),
-        None => None,
-    };
-    let mut processor = Processor::new(ffmpeg_codec_id, opts.max_frames, initial_parameters)?;
+    let mut processor = Processor::new(ffmpeg_codec_id, opts.max_frames)?;
     loop {
         tokio::select! {
             item = session.next() => {
                 match item {
                     Some(Ok(CodecItem::VideoFrame(f))) => {
-                        let params = f.has_new_parameters().then(|| match session.streams()[video_stream_i].parameters() {
-                            Some(ParametersRef::Video(v)) => v,
-                            _ => unreachable!(),
-                        });
-                        if !processor.send_frame(f, params)? {
+                        if !processor.send_frame(f)? {
                             break;
                         }
                     },

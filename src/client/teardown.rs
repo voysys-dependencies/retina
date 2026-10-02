@@ -1,9 +1,10 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bytes::Bytes;
-use rtsp_types::{Method, Request};
 use url::Url;
+
+use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 
 use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
 use crate::{Error, error::ErrorInt};
@@ -72,10 +73,18 @@ pub(super) async fn teardown_loop_forever(
     mut conn: Option<RtspConnection>,
     tx: &mut tokio::sync::watch::Sender<Option<Result<(), Error>>>,
 ) {
-    let mut req = rtsp_types::Request::builder(Method::Teardown, rtsp_types::Version::V1_0)
-        .request_uri(url.clone())
-        .header(rtsp_types::headers::SESSION, session_id.to_string())
-        .build(Bytes::new());
+    let mut req = OwnedMessage::Request {
+        head: msg::Request {
+            method: msg::Method::TEARDOWN,
+            request_uri: Some(url.clone()),
+            headers: [(
+                msg::HeaderName::SESSION,
+                msg::HeaderValue::try_from(session_id.to_string()).unwrap(),
+            )]
+            .into(),
+        },
+        body: Bytes::new(),
+    };
 
     let attempt_deadline = tokio::time::sleep(EXISTING_CONN_TIMEOUT);
     tokio::pin!(attempt_deadline);
@@ -110,7 +119,7 @@ pub(super) async fn teardown_loop_forever(
                         // Also, don't update tx, so await_teardown() won't
                         // fail early. Let's at least do an attempt with a fresh
                         // connection first.
-                        log::debug!("TEARDOWN on existing conn failed: {}", &e);
+                        log::debug!("TEARDOWN on existing conn failed: {}", e);
                     },
                 }
             },
@@ -146,7 +155,7 @@ pub(super) async fn teardown_loop_forever(
                         return
                     },
                     Err(e) => {
-                        log::debug!("TEARDOWN fresh connection attempt {} failed: {}", attempt_num, &e);
+                        log::debug!("TEARDOWN fresh connection attempt {} failed: {}", attempt_num, e);
                         let _ = tx.send(Some(Err(e)));
 
                         // Wait out the remaining time before trying again, to
@@ -166,24 +175,24 @@ pub(super) async fn teardown_loop_forever(
 
 /// Makes a single attempt on the supplied connection; caller is responsible for the timeout.
 async fn attempt(
-    req: &mut Request<Bytes>,
+    req: &mut OwnedMessage,
     tool: Option<&Tool>,
     options: &SessionOptions,
     requested_auth: &mut Option<http_auth::PasswordClient>,
     mut conn: RtspConnection,
-) -> Result<rtsp_types::StatusCode, Error> {
+) -> Result<StatusCode, Error> {
     let e = match conn
         .send(ResponseMode::Teardown, options, tool, requested_auth, req)
         .await
     {
-        Ok((_ctx, _cseq, resp)) => return Ok(resp.status()),
+        Ok((_ctx, _cseq, resp, _body)) => return Ok(resp.status_code),
         Err(e) => e,
     };
 
     // Use a second match clause to look inside the Arc.
     match *e.0 {
         ErrorInt::RtspResponseError { status, .. }
-            if status == rtsp_types::StatusCode::SessionNotFound ||
+            if status == StatusCode::SESSION_NOT_FOUND ||
 
             // This is deeply unsatisfying, but at least the Hikvision
             // DS-2CD2032 with firmware V5.4.41 build 170312 exhibits the
@@ -199,7 +208,7 @@ async fn attempt(
             // session is in no way tied to a transport-level connection such as
             // a TCP connection". Nonetheless, we'll go along with this for now
             // by assuming the session is gone when we get a 500 response.
-            status == rtsp_types::StatusCode::InternalServerError =>
+            status == StatusCode::INTERNAL_SERVER_ERROR =>
         {
             Ok(status)
         }

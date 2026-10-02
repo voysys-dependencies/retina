@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Proof-of-concept `.mp4` writer.
@@ -514,7 +514,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     ) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
-            &frame.timestamp(),
+            frame.timestamp(),
             frame.data().remaining(),
         );
         let sample_description_index = if let (Some(i), false) = (
@@ -733,7 +733,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some(i) = video_stream_i {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .frame_format(retina::codec::FrameFormat::MP4),
+            )
             .await?;
     }
     let audio_stream = if !opts.no_audio {
@@ -764,7 +769,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some((i, _)) = audio_stream {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .frame_format(retina::codec::FrameFormat::MP4),
+            )
             .await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {

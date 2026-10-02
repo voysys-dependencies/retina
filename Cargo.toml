@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "examples/client", "examples/ffmpeg-decode", "examples/webrtc-proxy"]
+members = [".", "examples/client", "examples/ffmpeg-decode", "examples/webrtc-proxy", "fuzz"]
 default-members = ["."]
 
 [package]
 name = "retina"
-version = "0.4.14"
+version = "0.4.20"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
 edition = "2024"
@@ -34,6 +34,7 @@ all-features = true
 base64 = "0.22.0"
 bitstream-io = "2.6"
 bytes = "1.10"
+derive_more = { version = "2", features = ["debug", "display", "error", "from"] }
 futures = "0.3.14"
 h264-reader = "0.8.0"
 hex = "0.4.3"
@@ -44,13 +45,10 @@ memchr = "2.7.4"
 pin-project = "1.0.7"
 pretty-hex = "0.4.0"
 rand = "0.10"
-rtsp-types = "0.1.0"
 sdp-types = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
 socket2 = "0.6"
-thiserror = "2.0.17"
-tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
-tokio-util = { version = "0.7.3", features = ["codec"] }
+tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2.2.1"
 
 tracy-client = { version = "0.19.0", default-features = false, optional = true }

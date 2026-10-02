@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Handles RTCP data as described in
@@ -20,6 +20,7 @@ use crate::PacketContext;
 /// *   All packets are RTCP version 2.
 /// *   Non-final packets have no padding.
 /// *   The packets' lengths add up to the compound packet's length.
+#[derive(Eq, PartialEq)]
 pub struct ReceivedCompoundPacket {
     pub(crate) ctx: PacketContext,
     pub(crate) stream_id: usize,

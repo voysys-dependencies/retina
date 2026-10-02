@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::{Error, anyhow};
@@ -62,7 +62,7 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
                     CodecItem::MessageFrame(m) => {
                         info!(
                             "{}: {}\n",
-                            &m.timestamp(),
+                            m.timestamp(),
                             std::str::from_utf8(m.data()).unwrap(),
                         );
                     },

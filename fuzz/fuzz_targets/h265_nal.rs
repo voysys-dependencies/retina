@@ -1,4 +1,4 @@
-// Copyright (C) 2024 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #![no_main]
@@ -7,6 +7,7 @@ use libfuzzer_sys::fuzz_target;
 use retina::codec::h265::nal;
 
 fuzz_target!(|data: &[u8]| {
+    retina_fuzz::init_logging();
     let Ok((h, bits)) = nal::split(data) else {
         return;
     };
