@@ -741,6 +741,17 @@ impl Depacketizer {
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
+        // Inline parameter sets are stripped unless kept as received; they're handled via
+        // ParameterSetInsertion and the canonical copy in self.parameters.
+        let keep_parameter_sets =
+            self.frame_format.parameter_set_insertion == ParameterSetInsertion::AsReceived;
+        let retained = |hdr: NalHeader| {
+            keep_parameter_sets
+                || !matches!(
+                    hdr.nal_unit_type(),
+                    UnitType::SeqParameterSet | UnitType::PicParameterSet
+                )
+        };
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
@@ -776,12 +787,7 @@ impl Depacketizer {
             if nal.hdr.nal_ref_idc() != 0 {
                 is_disposable = false;
             }
-            // Always strip inline parameter sets; they're handled via
-            // ParameterSetInsertion and the canonical copy in self.parameters.
-            if !matches!(
-                nal.hdr.nal_unit_type(),
-                UnitType::SeqParameterSet | UnitType::PicParameterSet
-            ) {
+            if retained(nal.hdr) {
                 retained_len += 4usize + crate::to_usize(nal.len);
             }
             piece_idx = next_piece_idx;
@@ -826,7 +832,7 @@ impl Depacketizer {
             && match self.frame_format.parameter_set_insertion {
                 ParameterSetInsertion::EachKeyFrame => true,
                 ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
+                ParameterSetInsertion::Never | ParameterSetInsertion::AsReceived => false,
             };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
@@ -847,15 +853,12 @@ impl Depacketizer {
             }
         }
 
-        // Write non-parameter-set NALs with the configured framing.
+        // Write the retained NALs with the configured framing.
         piece_idx = 0;
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            if !matches!(
-                nal.hdr.nal_unit_type(),
-                UnitType::SeqParameterSet | UnitType::PicParameterSet
-            ) {
+            if retained(nal.hdr) {
                 let prefix = match self.frame_format.h26x_framing {
                     Framing::FourByteLength => nal.len.to_be_bytes(),
                     Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
@@ -3371,5 +3374,61 @@ mod tests {
         );
         assert!(frame.is_random_access_point());
         assert_eq!(d.pull(), None);
+    }
+
+    /// `AsReceived` keeps the parameter sets where the sender put them, also on a picture that
+    /// isn't a key frame, as an intra refresh stream sends them.
+    #[test]
+    fn as_received_keeps_parameter_sets_where_sent() {
+        init_logging();
+        let sps = b"\x67\x64\x00\x1e\xac\x2c\x6a\x82\xc0\xf6\x9b\x82\x80\x82\xa0\x00\x00\x03\x00\x20\x00\x00\x03\x03\xd0\x80";
+        let pps = b"\x68\xee\x31\xb2\x1b";
+        let nals: [&[u8]; 3] = [sps, pps, b"\x41non-idr slice"];
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            h26x_framing: super::super::h26x::Framing::AnnexB,
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::AsReceived,
+            ..Default::default()
+        });
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        for (i, nal) in nals.iter().enumerate() {
+            assert_eq!(d.pull(), None);
+            let pkt = ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: i as u16,
+                loss: 0,
+                mark: i == nals.len() - 1,
+                payload_type: 0,
+            }
+            .build(nal.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+            .unwrap();
+        }
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            _ => panic!(),
+        };
+        let expected: Vec<u8> = nals
+            .iter()
+            .flat_map(|nal| super::super::h26x::ANNEX_B_START_CODE.iter().chain(*nal))
+            .copied()
+            .collect();
+        assert_eq_hex!(frame.data(), expected);
+        assert!(frame.has_new_parameters());
+        assert!(!frame.is_random_access_point());
     }
 }

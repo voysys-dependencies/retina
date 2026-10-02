@@ -174,6 +174,9 @@ pub enum ParameterSetInsertion {
     /// Never insert in-band; caller retrieves them out-of-band via
     /// [`VideoParameters`].
     Never,
+
+    /// Keep the in-band parameter sets where the sender put them, and insert none.
+    AsReceived,
 }
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.

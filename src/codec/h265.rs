@@ -560,6 +560,17 @@ impl Depacketizer {
         let mut new_vps = None::<Bytes>;
         let mut new_sps = None::<Bytes>;
         let mut new_pps = None::<Bytes>;
+        // Inline parameter sets are stripped unless kept as received; they're handled via
+        // ParameterSetInsertion and the canonical copy in self.parameters.
+        let keep_parameter_sets =
+            self.frame_format.parameter_set_insertion == ParameterSetInsertion::AsReceived;
+        let retained = |hdr: nal::Header| {
+            keep_parameter_sets
+                || !matches!(
+                    hdr.unit_type(),
+                    nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+                )
+        };
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
@@ -604,12 +615,7 @@ impl Depacketizer {
                 }
                 _ => {}
             }
-            // Always strip inline parameter sets; they're handled via
-            // ParameterSetInsertion and the canonical copy in self.parameters.
-            if !matches!(
-                nal.hdr.unit_type(),
-                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
-            ) {
+            if retained(nal.hdr) {
                 retained_len += 4usize + crate::to_usize(nal.len);
             }
             piece_idx = next_piece_idx;
@@ -652,7 +658,7 @@ impl Depacketizer {
             && match self.frame_format.parameter_set_insertion {
                 ParameterSetInsertion::EachKeyFrame => true,
                 ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
+                ParameterSetInsertion::Never | ParameterSetInsertion::AsReceived => false,
             };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
@@ -673,16 +679,13 @@ impl Depacketizer {
             }
         }
 
-        // Write non-parameter-set NALs with the configured framing.
+        // Write the retained NALs with the configured framing.
         piece_idx = 0;
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
 
-            if !matches!(
-                nal.hdr.unit_type(),
-                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
-            ) {
+            if retained(nal.hdr) {
                 let prefix = match self.frame_format.h26x_framing {
                     Framing::FourByteLength => nal.len.to_be_bytes(),
                     Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
