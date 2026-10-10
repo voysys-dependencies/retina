@@ -2101,6 +2101,7 @@ dependencies = [
  "hex",
  "http-auth",
  "jiff",
+ "libc",
  "log",
  "memchr",
  "mylog",

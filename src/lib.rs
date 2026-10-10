@@ -441,6 +441,31 @@ pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usiz
     Some(off..end)
 }
 
+const RTP_RECV_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// On Linux, `SO_RCVBUFFORCE` goes past `net.core.rmem_max` when the process has `CAP_NET_ADMIN`.
+fn set_recv_buffer_size(socket: &socket2::Socket, size: usize) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let value = libc::c_int::try_from(size).unwrap_or(libc::c_int::MAX);
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+    }
+    socket.set_recv_buffer_size(size)
+}
+
 /// A pair of local UDP sockets used for RTP and RTCP transmission.
 ///
 /// The RTP port is always even, and the RTCP port is always the following (odd) integer.
@@ -467,7 +492,7 @@ impl UdpPair {
             };
             let socket =
                 socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-            socket.set_recv_buffer_size(10 * 1024 * 1024)?;
+            set_recv_buffer_size(&socket, RTP_RECV_BUFFER_SIZE)?;
 
             let rtp_socket = match socket.bind(&sock_addr) {
                 Ok(_) => UdpSocket::from(socket),

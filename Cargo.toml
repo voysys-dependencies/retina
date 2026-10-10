@@ -55,6 +55,9 @@ url = "2.2.1"
 
 tracy-client = { version = "0.19.0", default-features = false, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 mylog = { git = "https://github.com/scottlamb/mylog" }
