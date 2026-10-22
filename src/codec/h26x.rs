@@ -13,6 +13,16 @@ use crate::inputs::{Input as _, Split};
 /// We use the 4-byte form everywhere for simplicity.
 pub const ANNEX_B_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// Stands in for lost data with [`super::DamagedAccessUnits::Keep`]: zero padding before an Annex B
+/// start code.
+pub(super) const LOST_DATA: [u8; 4] = [0; 4];
+
+pub(super) fn push_lost_data(data: &mut Vec<u8>, lost_ranges: &mut Vec<std::ops::Range<usize>>) {
+    let start = data.len();
+    data.extend_from_slice(&LOST_DATA);
+    lost_ranges.push(start..data.len());
+}
+
 /// How to frame H.26x NAL units in output (packet format and extra data format).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {
@@ -205,6 +215,14 @@ impl Deferred {
 }
 
 impl<A: U8Array> AnnexBScanner<A> {
+    /// Ends the NAL in progress, if any, after the data scanned so far.
+    pub(super) fn finish<H: NalHandler<HeaderArray = A>>(
+        &mut self,
+        handler: &mut H,
+    ) -> Result<(), String> {
+        self.scan(0, Split::new(&[], &[]), true, handler)
+    }
+
     /// Scans the bytes represented within `data`, which start at buffer position `pos`.
     /// `end` means the enclosing payload is ending (in other words, this is not
     /// a start or middle of a fragmentation unit). Sends pieces on to

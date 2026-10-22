@@ -19,7 +19,7 @@ use log::{debug, log_enabled, trace};
 
 use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
 use crate::codec::h26x::TolerantBitReader;
-use crate::codec::{CodecItem, DepacketizeError};
+use crate::codec::{CodecItem, DamagedAccessUnits, DepacketizeError};
 use crate::inputs::Input as _;
 
 use super::VideoFrame;
@@ -79,6 +79,9 @@ struct Nal {
 
     /// The total length of this NAL, including the 2 header bytes.
     len: u32,
+
+    /// With [`DamagedAccessUnits::Keep`], data was lost after this NAL.
+    lost_after: bool,
 }
 
 /// An access unit that is currently being accumulated during `PreMark` state.
@@ -94,6 +97,12 @@ struct AccessUnit {
 
     /// RTP packets lost as this access unit was starting.
     loss: u16,
+
+    /// With [`DamagedAccessUnits::Keep`], data was lost before the first NAL kept.
+    lost_start: bool,
+
+    /// With [`DamagedAccessUnits::Keep`], dropping the fragments of a FU cut by loss.
+    skipping_fu: bool,
 
     same_ts_as_prev: bool,
 }
@@ -191,6 +200,58 @@ impl Depacketizer {
         self.mark = None;
     }
 
+    fn keeps_damaged(&self) -> bool {
+        self.frame_format.damaged_access_units == DamagedAccessUnits::Keep
+    }
+
+    /// Notes that `au` lost data at its current position. A fragmented NAL in progress ends here
+    /// if it's a slice segment and is left out otherwise; its later fragments are dropped.
+    fn note_loss(&mut self, au: &mut AccessUnit) -> Result<(), String> {
+        if au.in_fu {
+            au.in_fu = false;
+            au.skipping_fu = true;
+            let pieces = u32::try_from(self.pieces.len())
+                .map_err(|_| "more than u32::MAX pieces!".to_string())?;
+            let nal = self
+                .nals
+                .last_mut()
+                .ok_or("nals non-empty while in fu".to_string())?;
+            if is_vcl(nal.hdr) {
+                nal.next_piece_idx = pieces;
+            } else {
+                self.nals.pop();
+                let pieces = self
+                    .nals
+                    .last()
+                    .map_or(0, |n| crate::to_usize(n.next_piece_idx));
+                self.pieces.truncate(pieces);
+            }
+        }
+        match self.nals.last_mut() {
+            Some(nal) => nal.lost_after = true,
+            None => au.lost_start = true,
+        }
+        Ok(())
+    }
+
+    /// True if the access unit's first slice segment has `first_slice_segment_in_pic_flag` set
+    /// (H.265 section 7.3.6.1).
+    fn first_slice_starts_picture(&self, buf: &MarkBuf) -> bool {
+        let mut piece_idx = 0;
+        for nal in &self.nals {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            if is_vcl(nal.hdr) {
+                return self.pieces[piece_idx..next_piece_idx]
+                    .iter()
+                    .find(|piece| piece.len > 0)
+                    .and_then(|piece| buf.split(piece.pos, 1).peek_byte())
+                    .is_some_and(|byte| byte & 0x80 != 0);
+            }
+            piece_idx = next_piece_idx;
+        }
+        false
+    }
+
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters
             .as_ref()
@@ -220,6 +281,7 @@ impl Depacketizer {
         }
 
         let mut r = Ok(());
+        let keep = self.keeps_damaged();
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -229,7 +291,22 @@ impl Depacketizer {
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
                     let loss = meta.loss;
-                    if loss > 0 {
+                    if loss > 0 && keep {
+                        self.note_loss(&mut access_unit)?;
+                        if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
+                            access_unit.loss = access_unit.loss.saturating_add(loss);
+                            access_unit
+                        } else {
+                            if self.nals.is_empty() {
+                                self.discard_au();
+                            } else {
+                                access_unit.end_ctx = meta.ctx;
+                                let frame = self.finalize_access_unit(access_unit, "loss", buf)?;
+                                self.pending.push_back(Ok(frame));
+                            }
+                            AccessUnit::start(&meta, 0, false)
+                        }
+                    } else if loss > 0 {
                         self.discard_au();
                         if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
@@ -260,24 +337,27 @@ impl Depacketizer {
                             self.discard_au();
                             AccessUnit::start(&meta, 0, false)
                         } else {
-                            let last_nal_hdr = self
-                                .nals
-                                .last()
-                                .ok_or("nals should not be empty".to_string())?
-                                .hdr;
-                            if can_end_au(last_nal_hdr.unit_type()) {
-                                access_unit.end_ctx = meta.ctx;
-                                let frame =
-                                    self.finalize_access_unit(access_unit, "ts change", buf)?;
-                                self.pending.push_back(Ok(frame));
-                                AccessUnit::start(&meta, 0, false)
-                            } else {
-                                log::debug!(
-                                    "Bogus mid-access unit timestamp change after {:?}",
-                                    last_nal_hdr
-                                );
-                                access_unit.timestamp.timestamp = meta.timestamp.timestamp;
-                                access_unit
+                            match self.nals.last() {
+                                Some(nal) if can_end_au(nal.hdr.unit_type()) => {
+                                    access_unit.end_ctx = meta.ctx;
+                                    let frame =
+                                        self.finalize_access_unit(access_unit, "ts change", buf)?;
+                                    self.pending.push_back(Ok(frame));
+                                    AccessUnit::start(&meta, 0, false)
+                                }
+                                Some(nal) => {
+                                    log::debug!(
+                                        "Bogus mid-access unit timestamp change after {:?}",
+                                        nal.hdr
+                                    );
+                                    access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                                    access_unit
+                                }
+                                None if keep => {
+                                    access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                                    access_unit
+                                }
+                                None => return Err("nals should not be empty".into()),
                             }
                         }
                     } else {
@@ -332,6 +412,7 @@ impl Depacketizer {
                         "Non-fragmented NAL {hdr:?} while fragment in progress"
                     ));
                 }
+                access_unit.skipping_fu = false;
                 let next_piece_idx = self.add_piece(BufRange {
                     pos: payload_pos + 2,
                     len: payload_len - 2,
@@ -340,6 +421,7 @@ impl Depacketizer {
                     hdr,
                     next_piece_idx,
                     len: u32::from(payload_len),
+                    lost_after: false,
                 });
             }
             48 => {
@@ -347,6 +429,7 @@ impl Depacketizer {
                 if access_unit.in_fu {
                     return Err("AP while fragment in progress".into());
                 }
+                access_unit.skipping_fu = false;
                 // Skip the 2-byte AP header.
                 let mut payload = payload;
                 payload.advance(2);
@@ -380,6 +463,7 @@ impl Depacketizer {
                         hdr: nal_hdr,
                         next_piece_idx,
                         len: u32::from(nal_len),
+                        lost_after: false,
                     });
                     payload.advance(usize::from(nal_len));
                     pos += u64::from(nal_len);
@@ -412,6 +496,7 @@ impl Depacketizer {
                 match (start, access_unit.in_fu) {
                     (true, true) => return Err("FU with start bit while frag in progress".into()),
                     (true, false) => {
+                        access_unit.skipping_fu = false;
                         if end && !self.seen_single_fragment_fu {
                             // RFC 7798 section 4.4.3: "the Start bit and End bit MUST NOT both be
                             // set to one in the same FU header". Some cameras violate this by
@@ -432,6 +517,7 @@ impl Depacketizer {
                             hdr,
                             next_piece_idx: if end { pieces } else { u32::MAX },
                             len: 2 + u32_frag_len,
+                            lost_after: false,
                         });
                         access_unit.in_fu = !end;
                     }
@@ -461,6 +547,9 @@ impl Depacketizer {
                             return Err("FU has MARK and no END".into());
                         }
                     }
+                    (false, false) if keep && (loss > 0 || access_unit.skipping_fu) => {
+                        access_unit.skipping_fu = !end;
+                    }
                     (false, false) => {
                         if loss > 0 {
                             self.discard_au();
@@ -478,23 +567,23 @@ impl Depacketizer {
         }
 
         self.input_state = if mark {
-            let last_nal_hdr = self
-                .nals
-                .last()
-                .ok_or("nals should not be empty after mark".to_string())?
-                .hdr;
-            if can_end_au(last_nal_hdr.unit_type()) {
-                access_unit.end_ctx = ctx;
-                let frame = self.finalize_access_unit(access_unit, "mark", buf)?;
-                self.pending.push_back(Ok(frame));
-                DepacketizerInputState::PostMark { timestamp, loss: 0 }
-            } else {
-                log::debug!(
-                    "Bogus mid-access unit timestamp change after {:?}",
-                    last_nal_hdr
-                );
-                access_unit.timestamp.timestamp = timestamp.timestamp;
-                DepacketizerInputState::PreMark(access_unit)
+            match self.nals.last() {
+                Some(nal) if can_end_au(nal.hdr.unit_type()) || nal.lost_after => {
+                    access_unit.end_ctx = ctx;
+                    let frame = self.finalize_access_unit(access_unit, "mark", buf)?;
+                    self.pending.push_back(Ok(frame));
+                    DepacketizerInputState::PostMark { timestamp, loss: 0 }
+                }
+                Some(nal) => {
+                    log::debug!("Bogus mid-access unit mark on {:?}", nal.hdr);
+                    access_unit.timestamp.timestamp = timestamp.timestamp;
+                    DepacketizerInputState::PreMark(access_unit)
+                }
+                None if keep => DepacketizerInputState::PostMark {
+                    timestamp,
+                    loss: access_unit.loss,
+                },
+                None => return Err("nals should not be empty after mark".into()),
             }
         } else {
             DepacketizerInputState::PreMark(access_unit)
@@ -656,6 +745,13 @@ impl Depacketizer {
             false
         };
 
+        let lost_start =
+            self.keeps_damaged() && au.lost_start && !self.first_slice_starts_picture(buf);
+        let losses = usize::from(lost_start) + self.nals.iter().filter(|n| n.lost_after).count();
+        retained_len += losses * super::h26x::LOST_DATA.len();
+        let damaged_without_slices = losses > 0 && !self.nals.iter().any(|n| is_vcl(n.hdr));
+        is_random_access_point &= !damaged_without_slices;
+
         // Determine whether to prepend parameter sets.
         let prepend_params = is_random_access_point
             && match self.frame_format.parameter_set_insertion {
@@ -669,6 +765,7 @@ impl Depacketizer {
         }
 
         let mut data = Vec::with_capacity(retained_len);
+        let mut lost_ranges = Vec::new();
 
         // Prepend parameter sets if requested.
         if prepend_params && let Some(ref p) = self.parameters {
@@ -680,6 +777,9 @@ impl Depacketizer {
                 data.extend_from_slice(&prefix);
                 data.extend_from_slice(param_nal);
             }
+        }
+        if lost_start {
+            super::h26x::push_lost_data(&mut data, &mut lost_ranges);
         }
 
         // Write the retained NALs with the configured framing.
@@ -705,6 +805,9 @@ impl Depacketizer {
                 }
                 debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
+            if nal.lost_after {
+                super::h26x::push_lost_data(&mut data, &mut lost_ranges);
+            }
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -723,9 +826,16 @@ impl Depacketizer {
             is_random_access_point,
             is_disposable,
             data,
-            lost_ranges: Vec::new(),
+            lost_ranges,
         })
     }
+}
+
+fn is_vcl(hdr: nal::Header) -> bool {
+    matches!(
+        hdr.unit_type().unit_type_class(),
+        nal::UnitTypeClass::Vcl { .. }
+    )
 }
 
 /// Returns true if we allow the given NAL unit type to end an access unit.
@@ -767,6 +877,8 @@ impl AccessUnit {
 
             // TODO: overflow?
             loss: meta.loss + additional_loss,
+            lost_start: meta.loss > 0,
+            skipping_fu: false,
             same_ts_as_prev,
         }
     }
@@ -1636,6 +1748,188 @@ mod tests {
         };
         assert_eq!(f.data, *b"\x00\x00\x00\x07\x4e\x01plain");
         assert_eq!(d.pull(), None);
+    }
+
+    /// Depacketizes `(sequence number, timestamp, mark, payload)` packets, with packets lost where
+    /// sequence numbers are skipped, into Annex B frames.
+    fn frames_with(
+        damaged_access_units: crate::codec::DamagedAccessUnits,
+        packets: &[(u16, i64, bool, &[u8])],
+    ) -> Vec<crate::codec::VideoFrame> {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            h26x_framing: super::super::h26x::Framing::AnnexB,
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::AsReceived,
+            damaged_access_units,
+            ..Default::default()
+        });
+        let mut frames = Vec::new();
+        let mut next_sequence_number = 0;
+        for &(sequence_number, timestamp, mark, payload) in packets {
+            let pkt = ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: crate::Timestamp {
+                    timestamp,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number,
+                loss: sequence_number - next_sequence_number,
+                mark,
+                payload_type: 0,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            next_sequence_number = sequence_number + 1;
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+            .unwrap();
+            while let Some(item) = d.pull() {
+                match item {
+                    Ok(CodecItem::VideoFrame(frame)) => frames.push(frame),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        frames
+    }
+
+    fn kept_frames(packets: &[(u16, i64, bool, &[u8])]) -> Vec<crate::codec::VideoFrame> {
+        frames_with(crate::codec::DamagedAccessUnits::Keep, packets)
+    }
+
+    /// Where `frame` reports four bytes of lost data.
+    fn lost_at(frame: &crate::codec::VideoFrame) -> Vec<usize> {
+        frame
+            .lost_ranges()
+            .iter()
+            .map(|range| {
+                assert_eq!(range.len(), 4);
+                range.start
+            })
+            .collect()
+    }
+
+    /// Annex B data of `nals`, with `None` for four zero bytes of lost data.
+    fn annex_b(nals: &[Option<&[u8]>]) -> Vec<u8> {
+        nals.iter()
+            .flat_map(|nal| match nal {
+                Some(nal) => [&super::super::h26x::ANNEX_B_START_CODE[..], nal].concat(),
+                None => vec![0; 4],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keep_cuts_a_slice_segment_at_lost_fragments_and_keeps_later_ones() {
+        let packets: [(u16, i64, bool, &[u8]); 5] = [
+            (0, 0, false, b"\x62\x01\x81\x9asegment 1 start, "),
+            (2, 0, false, b"\x62\x01\x41segment 1 end"),
+            (3, 0, true, b"\x02\x01Asegment 2"),
+            (4, 1, false, b"\x62\x01\x81\x9aintact"),
+            (5, 1, true, b"\x62\x01\x41 segment"),
+        ];
+        let frames = kept_frames(&packets);
+        assert_eq!(frames.len(), 2);
+        assert_eq_hex!(
+            frames[0].data(),
+            annex_b(&[
+                Some(b"\x02\x01\x9asegment 1 start, "),
+                None,
+                Some(b"\x02\x01Asegment 2")
+            ])
+        );
+        assert_eq!(lost_at(&frames[0]), [24]);
+        assert_eq!(frames[0].loss(), 1);
+        assert_eq_hex!(
+            frames[1].data(),
+            annex_b(&[Some(b"\x02\x01\x9aintact segment")])
+        );
+        assert!(frames[1].lost_ranges().is_empty());
+
+        let discarded = frames_with(crate::codec::DamagedAccessUnits::Discard, &packets);
+        assert_eq!(discarded.len(), 1);
+        assert_eq_hex!(discarded[0].data(), frames[1].data());
+    }
+
+    #[test]
+    fn keep_reports_a_lost_start_and_tail() {
+        let frames = kept_frames(&[
+            (1, 0, false, b"\x62\x01\x01segment 1 middle"),
+            (2, 0, false, b"\x62\x01\x41segment 1 end"),
+            (3, 0, false, b"\x62\x01\x81Asegment 2 start, "),
+            (5, 1, true, b"\x02\x01\x9anext"),
+        ]);
+        assert_eq!(frames.len(), 2);
+        assert_eq_hex!(
+            frames[0].data(),
+            annex_b(&[None, Some(b"\x02\x01Asegment 2 start, "), None])
+        );
+        assert_eq!(lost_at(&frames[0]), [0, 28]);
+        assert_eq_hex!(frames[1].data(), annex_b(&[Some(b"\x02\x01\x9anext")]));
+        assert!(frames[1].lost_ranges().is_empty());
+    }
+
+    /// A picture of which nothing arrived counts its lost packets for the next one, whose start is
+    /// intact.
+    #[test]
+    fn keep_counts_the_loss_of_a_picture_with_nothing_kept() {
+        let packets: [(u16, i64, bool, &[u8]); 3] = [
+            (1, 0, false, b"\x62\x01\x01segment middle"),
+            (2, 0, true, b"\x62\x01\x41segment end"),
+            (3, 1, true, b"\x02\x01Anext"),
+        ];
+        let frames = kept_frames(&packets);
+        assert_eq!(frames.len(), 1);
+        assert_eq_hex!(frames[0].data(), annex_b(&[Some(b"\x02\x01Anext")]));
+        assert!(frames[0].lost_ranges().is_empty());
+        assert_eq!(frames[0].loss(), 1);
+        let discarded = frames_with(crate::codec::DamagedAccessUnits::Discard, &packets);
+        assert_eq!(discarded[0].loss(), 1);
+    }
+
+    /// A slice segment of only its header can't show whether it starts its picture.
+    #[test]
+    fn keep_reports_a_lost_start_before_a_header_only_slice_segment() {
+        let frames = kept_frames(&[(1, 0, true, b"\x02\x01")]);
+        assert_eq!(frames.len(), 1);
+        assert_eq_hex!(frames[0].data(), annex_b(&[None, Some(b"\x02\x01")]));
+        assert_eq!(lost_at(&frames[0]), [0]);
+    }
+
+    /// The segments of a lost aggregation packet are lost between the segments around it, and a
+    /// prefix SEI missing fragments is left out.
+    #[test]
+    fn keep_reports_a_lost_aggregation_packet() {
+        let frames = kept_frames(&[
+            (0, 0, false, b"\x02\x01\x9asegment 1"),
+            (2, 0, false, b"\x62\x01\xa7SEI start, "),
+            (
+                4,
+                0,
+                true,
+                b"\x60\x01\x00\x0c\x02\x01Asegment 4\x00\x0c\x02\x01Asegment 5",
+            ),
+        ]);
+        assert_eq!(frames.len(), 1);
+        assert_eq_hex!(
+            frames[0].data(),
+            annex_b(&[
+                Some(b"\x02\x01\x9asegment 1"),
+                None,
+                Some(b"\x02\x01Asegment 4"),
+                Some(b"\x02\x01Asegment 5")
+            ])
+        );
+        assert_eq!(lost_at(&frames[0]), [16]);
     }
 
     /// An aggregation packet can't end a fragmented NAL; it's an error, and the next access unit decodes.

@@ -137,6 +137,9 @@ pub struct FrameFormat {
     /// When to insert parameter sets (SPS/PPS/VPS) into frame data.
     pub parameter_set_insertion: ParameterSetInsertion,
 
+    /// What to do with an H.26x access unit that lost packets.
+    pub damaged_access_units: DamagedAccessUnits,
+
     /// How to frame AAC audio.
     pub aac_framing: aac::Framing,
 }
@@ -147,6 +150,7 @@ impl FrameFormat {
     pub const MP4: Self = Self {
         h26x_framing: h26x::Framing::FourByteLength,
         parameter_set_insertion: ParameterSetInsertion::Never,
+        damaged_access_units: DamagedAccessUnits::Discard,
         aac_framing: aac::Framing::Raw,
     };
 
@@ -156,6 +160,7 @@ impl FrameFormat {
     pub const SIMPLE: Self = Self {
         h26x_framing: h26x::Framing::AnnexB,
         parameter_set_insertion: ParameterSetInsertion::EachKeyFrame,
+        damaged_access_units: DamagedAccessUnits::Discard,
         aac_framing: aac::Framing::Adts,
     };
 }
@@ -177,6 +182,21 @@ pub enum ParameterSetInsertion {
 
     /// Keep the in-band parameter sets where the sender put them, and insert none.
     AsReceived,
+}
+
+/// What to do with an H.264 or H.265 access unit that lost packets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DamagedAccessUnits {
+    /// Discard it. Default.
+    #[default]
+    Discard,
+
+    /// Keep what arrived and report where data is missing in [`VideoFrame::lost_ranges`], for
+    /// [`h26x::Framing::AnnexB`] only. RTP doesn't say how much was lost, so each range is four
+    /// zero bytes where the loss falls, after the NAL unit that arrived before it. A slice whose
+    /// later fragments were lost ends there; other NAL units missing fragments are left out. A
+    /// lost start is not reported when the access unit's first slice starts its picture.
+    Keep,
 }
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
@@ -719,8 +739,8 @@ impl VideoFrame {
         self.has_new_parameters
     }
 
-    /// Returns the number of lost RTP packets before this video frame. See
-    /// [`crate::rtp::ReceivedPacket::loss`].
+    /// Returns the number of lost RTP packets before this video frame and, with
+    /// [`DamagedAccessUnits::Keep`], between its packets. See [`crate::rtp::ReceivedPacket::loss`].
     ///
     /// Note that if loss occurs during a fragmented frame, more than this
     /// number of packets' worth of data may be skipped.
@@ -730,8 +750,9 @@ impl VideoFrame {
     }
 
     /// Returns the ranges of [`Self::data`] that were lost in transport and are zero-filled, as
-    /// far as the depacketizer can place them. Only RTP/JPEG reports them, from fragment offsets;
-    /// other codecs discard pictures with interior loss.
+    /// far as the depacketizer can place them. RTP/JPEG reports them from fragment offsets, and
+    /// H.264 and H.265 with [`DamagedAccessUnits::Keep`]; otherwise they discard pictures with
+    /// interior loss.
     #[inline]
     pub fn lost_ranges(&self) -> &[std::ops::Range<usize>] {
         &self.lost_ranges
