@@ -344,6 +344,9 @@ impl Depacketizer {
             }
             48 => {
                 // Aggregation Packet. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.2
+                if access_unit.in_fu {
+                    return Err("AP while fragment in progress".into());
+                }
                 // Skip the 2-byte AP header.
                 let mut payload = payload;
                 payload.advance(2);
@@ -1632,6 +1635,49 @@ mod tests {
             panic!()
         };
         assert_eq!(f.data, *b"\x00\x00\x00\x07\x4e\x01plain");
+        assert_eq!(d.pull(), None);
+    }
+
+    /// An aggregation packet can't end a fragmented NAL; it's an error, and the next access unit decodes.
+    #[test]
+    fn aggregation_packet_while_fragment_in_progress() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let mut push = |timestamp: i64, sequence_number: u16, mark: bool, payload: &[u8]| {
+            let pkt = ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: crate::Timestamp {
+                    timestamp,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number,
+                loss: 0,
+                mark,
+                payload_type: 0,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        };
+        push(0, 0, false, b"\x62\x01\x81fu start, ").unwrap();
+        assert_eq!(
+            push(0, 1, true, b"\x60\x01\x00\x05\x02\x01abc").unwrap_err(),
+            "AP while fragment in progress"
+        );
+        push(1, 2, true, b"\x02\x01next").unwrap();
+        let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
+            panic!()
+        };
+        assert_eq!(f.data, *b"\x00\x00\x00\x06\x02\x01next");
         assert_eq!(d.pull(), None);
     }
 
